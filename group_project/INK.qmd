@@ -1,0 +1,694 @@
+---
+title: "B2_Ccontraceptive_project"
+format: html
+editor: source
+execute:
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    fig-path: "figures/INK-"
+---
+```{r}
+library(tidyverse)
+
+library(here)
+
+library(microViz)
+
+library(phyloseq)
+
+```
+
+```{r}
+# The phyloseq object microViz needs, built from the group B microbiome table
+source(here::here("R/count_tables.R"))
+ps_species <- as_counts(dataset = "group_b", table = "microbiome")
+ps_species
+```
+
+```{r}
+
+data_dir <- "data/2-workshop2/group_b_contraception"
+
+metadata <- read_csv(here(data_dir, "01_metadata.csv"))
+microbiome_counts <- read_csv(here(data_dir, "02_microbiome_counts.csv"))
+microbiome_taxonomy <- read_csv(here(data_dir, "03_microbiome_taxonomy.csv"))
+rnaseq_counts <- read_csv(here(data_dir, "04_rnaseq_counts.csv.gz"))
+gene_annotation <- read_csv(here(data_dir, "05_gene_annotation.csv"))
+cytokines <- read_csv(here(data_dir, "06_cytokines.csv"))
+
+```
+
+```{r}
+print(metadata)
+print(microbiome_counts)
+print(microbiome_taxonomy)
+print(rnaseq_counts)
+print(gene_annotation)
+print(cytokines)
+
+```
+## Metadata QC
+```{r}
+metadata |>
+  summarise(
+    n_samples = n(),
+    n_participants = n_distinct(participant_id),
+    missing_sample_ids = sum(is.na(sample_id)),
+    duplicate_sample_ids = sum(duplicated(sample_id)),
+    missing_participant_ids = sum(is.na(participant_id)),
+    duplicate_participant_ids = sum(duplicated(participant_id))
+  )
+```
+
+Check missing values in each metadata column:
+
+```{r}
+metadata |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "missing_values")
+```
+
+Check that the metadata sample IDs match the sample columns in both count tables:
+
+```{r}
+metadata_sample_ids <- metadata$sample_id
+microbiome_sample_ids <- names(microbiome_counts)[-1]
+rnaseq_sample_ids <- names(rnaseq_counts)[-1]
+
+tibble(
+  table = c("Microbiome", "RNA-seq"),
+  samples_missing_from_metadata = c(
+    length(setdiff(microbiome_sample_ids, metadata_sample_ids)),
+    length(setdiff(rnaseq_sample_ids, metadata_sample_ids))
+  ),
+  metadata_samples_missing_from_table = c(
+    length(setdiff(metadata_sample_ids, microbiome_sample_ids)),
+    length(setdiff(metadata_sample_ids, rnaseq_sample_ids))
+  )
+)
+```
+
+Review the number of samples in each study group and metadata category:
+
+```{r}
+metadata |> count(arm, sort = TRUE)
+metadata |> count(bv, sort = TRUE)
+metadata |> count(any_sti, sort = TRUE)
+metadata |> count(rnaseq_batch, sort = TRUE)
+```
+
+Check ranges and summary values for the numeric measurements:
+
+```{r}
+metadata |> select(nugent, ph) |> summary()
+```
+
+```{r}
+datasets <- list(
+  metadata = metadata,
+  species = microbiome_counts,
+  taxonomy = microbiome_taxonomy,
+  genes = rnaseq_counts,
+  genes_2_annot = gene_annotation,
+  cytokine_df = cytokines
+)
+
+qc_data <- purrr::imap_dfr(datasets, function(data, dataset_name) {
+  tibble::tibble(
+    dataset = dataset_name,
+    rows = nrow(data),
+    columns = ncol(data),
+    missing_cells = sum(is.na(data)),
+    rows_with_missing = sum(!complete.cases(data)),
+    duplicate_rows = sum(duplicated(data))
+  )
+})
+
+qc_table <- qc_data %>%
+  gtsummary::tbl_summary(
+    by = dataset,
+    include = c(rows, columns, missing_cells, rows_with_missing, duplicate_rows),
+    statistic = gtsummary::all_continuous() ~ "{mean}",
+    digits = gtsummary::all_continuous() ~ 0,
+    label = list(
+      rows ~ "Rows",
+      columns ~ "Columns",
+      missing_cells ~ "Missing cells",
+      rows_with_missing ~ "Rows with missing values",
+      duplicate_rows ~ "Duplicate rows"
+    ),
+    missing = "no"
+  )
+
+qc_table  # Display the table in the rendered report
+
+gt::gtsave(
+  gtsummary::as_gt(qc_table),
+  filename = here::here("group_project", "qc_table.html")
+)
+```
+
+
+###Do the three methods differ in community composition?
+
+
+```{r}
+run_arm_permanova <- function(distance_name, transform_name) {
+  result <- ps_species |>
+    tax_transform(transform_name, rank = "species") |>
+    dist_calc(distance_name) |>
+    dist_permanova(variables = "arm", n_perms = 999, seed = 1) |>
+    perm_get() |>
+    as.data.frame()
+
+  tibble::tibble(
+    distance = distance_name,
+    R2 = result["arm", "R2"],
+    F = result["arm", "F"],
+    p_value = result["arm", "Pr(>F)"]
+  )
+}
+permanova_results <- dplyr::bind_rows(
+  run_arm_permanova("bray", "identity"),
+  run_arm_permanova("jaccard", "binary"),
+  run_arm_permanova("aitchison", "identity")
+) |>
+  dplyr::mutate(
+    distance = factor(
+      distance,
+      levels = c("bray", "jaccard", "aitchison"),
+      labels = c("Bray-Curtis", "Jaccard", "Aitchison")
+    )
+  )
+permanova_table_data <- permanova_results |>
+  dplyr::mutate(
+    p_value = dplyr::if_else(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) |>
+  dplyr::rename(
+    Test = distance,
+    `R-squared (R²)` = R2,
+    `F statistic` = F,
+    `P-value` = p_value
+  )
+permanova_gt <- gt::gt(permanova_table_data) |>
+  gt::tab_header(
+    title = gt::md("PERMANOVA: Community composition by contraceptive arm"),
+    subtitle = "Tests compare injectable, pill, and ring groups (999 permutations)"
+  ) |>
+  gt::fmt_number(columns = `R-squared (R²)`, decimals = 3) |>
+  gt::fmt_number(columns = `F statistic`, decimals = 2) |>
+  gt::cols_label(Test = "Distance metric") |>
+  gt::cols_align(align = "center", columns = -Test) |>
+  gt::tab_options(
+    table.width = gt::pct(100),
+    table.font.size = gt::px(14),
+    heading.title.font.size = gt::px(16),
+    data_row.padding = gt::px(6),
+    row.striping.include_table_body = TRUE
+  ) |>
+  gt::tab_source_note(
+    source_note = gt::md(
+      "R² is the proportion of community variation associated with contraceptive arm. P-values below 0.001 are shown as <0.001."
+    )
+  )
+
+permanova_gt
+table_dir <- here::here("group_project", "tables")
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+gt::gtsave(
+  permanova_gt,
+  filename = file.path(table_dir, "community_permanova_group_2.html")
+)
+```
+
+
+### Is bacterial vaginosis more common in one arm?
+
+```{r}
+bv_arm_levels <- c("injectable", "pill", "ring")
+bv_categories <- c("negative", "intermediate", "positive")
+
+if (!all(c("arm", "bv") %in% names(metadata))) {
+  stop("metadata must contain arm and bv columns.")
+}
+if (anyNA(metadata$arm) || anyNA(metadata$bv)) {
+  stop("Missing arm or BV values must be resolved before this comparison.")
+}
+if (!all(metadata$arm %in% bv_arm_levels)) {
+  stop("Unexpected arm values found in metadata.")
+}
+if (!all(metadata$bv %in% bv_categories)) {
+  stop("Unexpected BV categories found; check metadata$bv.")
+}
+
+bv_data <- metadata %>%
+  dplyr::mutate(
+    arm = factor(arm, levels = bv_arm_levels),
+    bv = factor(bv, levels = bv_categories),
+    bv_status = factor(
+      ifelse(bv == "positive", "Positive", "Not positive"),
+      levels = c("Not positive", "Positive")
+    )
+  )
+
+
+bv_categories_table <- gtsummary::tbl_cross(
+  data = bv_data,
+  row = bv,
+  col = arm,
+  percent = "column",
+  margin = "column",
+  digits = 1,
+  label = list(bv ~ "BV category", arm ~ "Contraceptive arm")
+) %>%
+  gtsummary::modify_caption(
+    "BV categories by contraceptive arm"
+  ) %>%
+  gtsummary::bold_labels()
+
+
+bv_prevalence_table <- gtsummary::tbl_cross(
+  data = bv_data,
+  row = bv_status,
+  col = arm,
+  percent = "column",
+  margin = "column",
+  digits = 1,
+  label = list(bv_status ~ "BV status", arm ~ "Contraceptive arm")
+) %>%
+  gtsummary::add_p(test = "fisher.test") %>%
+  gtsummary::modify_caption(
+    "Positive BV prevalence by contraceptive arm"
+  ) %>%
+  gtsummary::modify_footnote(
+    gtsummary::all_stat_cols() ~
+      "Values are participant counts and percentages within arm. Fisher's exact test compares positive with not positive BV."
+  ) %>%
+  gtsummary::bold_labels()
+
+bv_categories_table
+bv_prevalence_table
+
+
+bv_table_dir <- here::here("group_project", "tables")
+dir.create(bv_table_dir, recursive = TRUE, showWarnings = FALSE)
+
+gt::gtsave(
+  gtsummary::as_gt(bv_categories_table),
+  filename = file.path(bv_table_dir, "bv_categories_by_arm_group_2.html")
+)
+gt::gtsave(
+  gtsummary::as_gt(bv_prevalence_table),
+  filename = file.path(bv_table_dir, "bv_prevalence_by_arm_group_2.html")
+)
+```
+##BV presence was not significantly different between arms (Fisher's exact test p = 0.6).
+
+
+##The ring is delivered locally and the other two are systemic. Does the ring differ from the other two in host gene expression?
+
+
+
+```{r}
+
+library(DESeq2)
+
+# Make the comparison group from the metadata, not from the gene counts
+meta <- as.data.frame(metadata)
+
+if (anyNA(meta$arm) || anyNA(meta$rnaseq_batch)) {
+  stop("Resolve missing arm or rnaseq_batch values before analysis.")
+}
+
+meta$delivery <- factor(
+  ifelse(meta$arm == "ring", "ring", "systemic"),
+  levels = c("systemic", "ring")
+)
+meta$rnaseq_batch <- factor(meta$rnaseq_batch)
+
+# The first column contains gene IDs; the remaining columns are raw counts
+count_df <- as.data.frame(rnaseq_counts)
+gene_ids <- count_df[[1]]
+count_mat <- as.matrix(count_df[-1])
+rownames(count_mat) <- gene_ids
+
+if (anyDuplicated(gene_ids)) {
+  stop("Gene IDs are duplicated in the RNA-seq count table.")
+}
+if (any(!is.finite(count_mat)) || any(count_mat < 0) ||
+    any(count_mat != floor(count_mat))) {
+  stop("RNA-seq values must be non-negative whole-number raw counts.")
+}
+storage.mode(count_mat) <- "integer"
+
+# Match metadata rows to the count-table sample columns
+if (anyDuplicated(meta$sample_id) ||
+    !setequal(colnames(count_mat), meta$sample_id)) {
+  stop("RNA-seq sample IDs and metadata sample IDs do not match.")
+}
+
+meta <- meta[match(colnames(count_mat), meta$sample_id), ]
+rownames(meta) <- meta$sample_id
+stopifnot(identical(colnames(count_mat), rownames(meta)))
+
+# Check that delivery group and sequencing batch are not completely confounded
+design_matrix <- model.matrix(~ rnaseq_batch + delivery, data = meta)
+if (qr(design_matrix)$rank < ncol(design_matrix)) {
+  stop("Batch and delivery group are confounded; this model cannot separate their effects.")
+}
+
+# Remove genes with very low total counts, then run the differential-expression test
+keep <- rowSums(count_mat) >= 10
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat[keep, ],
+  colData = meta,
+  design = ~ rnaseq_batch + delivery
+)
+
+dds <- DESeq(dds)
+
+# Positive log2FoldChange means higher expression in ring users
+res <- results(
+  dds,
+  contrast = c("delivery", "ring", "systemic"),
+  alpha = 0.05
+)
+
+results_table <- as.data.frame(res) |>
+  tibble::rownames_to_column("gene_id") |>
+  dplyr::arrange(padj)
+
+# Show the 20 genes with the smallest adjusted p-values
+results_table |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::slice_head(n = 20)
+
+# Count genes meeting the chosen false-discovery threshold
+sum(results_table$padj < 0.05, na.rm = TRUE)
+```
+
+#User: run qc on my metadata. give explanations
+
+Copilot: I’ll check the analysis document and dataset metadata first, then run appropriate checks and explain what the results mean.
+
+Read
+Completed with input: {
+  "path": "/workspaces/Multi-omics_workshop2026/group_project/INK.qmd"
+}
+
+Find files matching `data/2-workshop2/**/01_metadata.csv`
+
+Ran terminal command: git status --short
+
+Read , lines 1 to 12
+Completed with input: {
+  "path": "/workspaces/Multi-omics_workshop2026/data/2-workshop2/group_b_contraception/01_metadata.csv",
+  "view_range": [
+    1,
+    12
+  ]
+}
+
+Ran terminal command: Rscript --version; quarto --version
+Tool execution failed with exit code 1
+
+Ran terminal command: python - <<'PY'
+import csv, gzip
+from pathlib import Path
+base=Path('data/2-workshop2/group_b_contraception')
+for name in ['01_metadata.csv','02_microbiome_counts.csv','04_rnaseq_counts.csv.gz']:
+ p=base/name
+ op=gzip.open if p.suffix=='.gz' else open
+ with op(p,'rt',newline='') as f:
+  rows=csv.reader(f)
+  header=next(rows)
+  print(name, 'columns=',len(header), 'first_columns=',header[:12])
+PY
+Tool execution failed with exit code 1
+
+User: ```{r}
+bv_arm_levels <- c("injectable", "pill", "ring")
+bv_categories <- c("negative", "intermediate", "positive")
+
+if (!all(c("arm", "bv") %in% names(metadata))) {
+  stop("metadata must contain arm and bv columns.")
+}
+if (anyNA(metadata$arm) || anyNA(metadata$bv)) {
+  stop("Missing arm or BV values must be resolved before this comparison.")
+}
+if (!all(metadata$arm %in% bv_arm_levels)) {
+  stop("Unexpected arm values found in metadata.")
+}
+if (!all(metadata$bv %in% bv_categories)) {
+  stop("Unexpected BV categories found; check metadata$bv.")
+}
+
+bv_data <- metadata %>%
+  dplyr::mutate(
+    arm = factor(arm, levels = bv_arm_levels),
+    bv = factor(bv, levels = bv_categories),
+    bv_status = factor(
+      ifelse(bv == "positive", "Positive", "Not positive"),
+      levels = c("Not positive", "Positive")
+    )
+  )
+
+
+bv_categories_table <- gtsummary::tbl_cross(
+  data = bv_data,
+  row = bv,
+  col = arm,
+  percent = "column",
+  margin = "column",
+  digits = 1,
+  label = list(bv ~ "BV category", arm ~ "Contraceptive arm")
+) %>%
+  gtsummary::modify_caption(
+    "BV categories by contraceptive arm"
+  ) %>%
+  gtsummary::bold_labels()
+
+
+bv_prevalence_table <- gtsummary::tbl_cross(
+  data = bv_data,
+  row = bv_status,
+  col = arm,
+  percent = "column",
+  margin = "column",
+  digits = 1,
+  label = list(bv_status ~ "BV status", arm ~ "Contraceptive arm")
+) %>%
+  gtsummary::add_p(test = "fisher.test") %>%
+  gtsummary::modify_caption(
+    "Positive BV prevalence by contraceptive arm"
+  ) %>%
+  gtsummary::modify_footnote(
+    gtsummary::all_stat_cols() ~
+      "Values are participant counts and percentages within arm. Fisher's exact test compares positive with not positive BV."
+  ) %>%
+  gtsummary::bold_labels()
+
+bv_categories_table
+bv_prevalence_table
+
+
+bv_table_dir <- here::here("group_project", "tables")
+dir.create(bv_table_dir, recursive = TRUE, showWarnings = FALSE)
+
+gt::gtsave(
+  gtsummary::as_gt(bv_categories_table),
+  filename = file.path(bv_table_dir, "bv_categories_by_arm_group_2.html")
+)
+gt::gtsave(
+  gtsummary::as_gt(bv_prevalence_table),
+  filename = file.path(bv_table_dir, "bv_prevalence_by_arm_group_2.html")
+)
+```, i need the r code to run chi-square instead of fishers exact
+
+Copilot: Search Tools
+
+Requested chat rename
+Completed with input: {
+  "title": "Chi-square test code",
+  "automatic": true
+}
+
+Replace `test = "fisher.test"` with `test = "chisq.test"`:
+
+```r
+bv_prevalence_table <- gtsummary::tbl_cross(
+  data = bv_data,
+  row = bv_status,
+  col = arm,
+  percent = "column",
+  margin = "column",
+  digits = 1,
+  label = list(bv_status ~ "BV status", arm ~ "Contraceptive arm")
+) %>%
+  gtsummary::add_p(test = "chisq.test") %>%
+  gtsummary::modify_caption(
+    "Positive BV prevalence by contraceptive arm"
+  ) %>%
+  gtsummary::modify_footnote(
+    gtsummary::all_stat_cols() ~
+      "Values are participant counts and percentages within arm. Pearson's chi-square test compares positive with not positive BV."
+  ) %>%
+  gtsummary::bold_labels()
+```
+
+The chi-square test checks whether BV status and contraceptive arm are associated. It relies on expected counts being sufficiently large; if several expected cell counts are small, its p-value may be unreliable. You can inspect the expected counts with:
+
+```r
+chisq.test(table(bv_data$bv_status, bv_data$arm))$expected
+```
+
+As a common rule of thumb, expected counts should generally be at least 5.
+
+User: is the code you have given me in r
+
+Copilot: Yes. It’s **R code**. In your Quarto document, put it inside an R code chunk marked with ` ```{r} `, like the other code in `INK.qmd`.
+
+The `chisq.test(...)$expected` line is also R code; it displays the expected counts so you can check whether the chi-square test is appropriate.
+
+User: The ring is delivered locally and the other two are systemic. Does the ring differ from the other two in host gene expression? how do i approach this
+
+
+Copilot: I’ll tailor the approach to the dataset and analysis already in your Quarto document, especially how the RNA-seq samples and treatment groups are represented.
+
+Read , lines 1 to 120
+Completed with input: {
+  "path": "/workspaces/Multi-omics_workshop2026/group_project/INK.qmd",
+  "view_range": [
+    1,
+    120
+  ]
+}
+
+Read , lines 180 to 311
+Completed with input: {
+  "path": "/workspaces/Multi-omics_workshop2026/group_project/INK.qmd",
+  "view_range": [
+    180,
+    311
+  ]
+}
+
+Read , lines 1 to 12
+Completed with input: {
+  "path": "/workspaces/Multi-omics_workshop2026/data/2-workshop2/group_b_contraception/01_metadata.csv",
+  "view_range": [
+    1,
+    12
+  ]
+}
+
+Ran terminal command: python - <<'PY'
+import csv, gzip
+from pathlib import Path
+base=Path('data/2-workshop2/group_b_contraception')
+for f in ['01_metadata.csv','04_rnaseq_counts.csv.gz','05_gene_annotation.csv']:
+ p=base/f
+ op=gzip.open if p.suffix=='.gz' else open
+ with op(p,'rt',newline='') as h:
+  r=csv.reader(h)
+  head=next(r)
+  print(f, 'header:', head[:15], 'n_cols:', len(head))
+  print('row1:', next(r)[:10])
+PY
+Tool execution failed with exit code 1
+
+User: i need r codes
+
+Copilot: Yes—here is R code to compare **ring users with injectable and pill users combined**, using the raw RNA-seq counts already loaded in your document. It adjusts for `rnaseq_batch` and checks that the samples line up before testing.
+
+Add this as an R chunk after loading `metadata` and `rnaseq_counts`:
+
+```r
+library(DESeq2)
+
+# Make the comparison group from the metadata, not from the gene counts
+meta <- as.data.frame(metadata)
+
+if (anyNA(meta$arm) || anyNA(meta$rnaseq_batch)) {
+  stop("Resolve missing arm or rnaseq_batch values before analysis.")
+}
+
+meta$delivery <- factor(
+  ifelse(meta$arm == "ring", "ring", "systemic"),
+  levels = c("systemic", "ring")
+)
+meta$rnaseq_batch <- factor(meta$rnaseq_batch)
+
+# The first column contains gene IDs; the remaining columns are raw counts
+count_df <- as.data.frame(rnaseq_counts)
+gene_ids <- count_df[[1]]
+count_mat <- as.matrix(count_df[-1])
+rownames(count_mat) <- gene_ids
+
+if (anyDuplicated(gene_ids)) {
+  stop("Gene IDs are duplicated in the RNA-seq count table.")
+}
+if (any(!is.finite(count_mat)) || any(count_mat < 0) ||
+    any(count_mat != floor(count_mat))) {
+  stop("RNA-seq values must be non-negative whole-number raw counts.")
+}
+storage.mode(count_mat) <- "integer"
+
+# Match metadata rows to the count-table sample columns
+if (anyDuplicated(meta$sample_id) ||
+    !setequal(colnames(count_mat), meta$sample_id)) {
+  stop("RNA-seq sample IDs and metadata sample IDs do not match.")
+}
+
+meta <- meta[match(colnames(count_mat), meta$sample_id), ]
+rownames(meta) <- meta$sample_id
+stopifnot(identical(colnames(count_mat), rownames(meta)))
+
+# Check that delivery group and sequencing batch are not completely confounded
+design_matrix <- model.matrix(~ rnaseq_batch + delivery, data = meta)
+if (qr(design_matrix)$rank < ncol(design_matrix)) {
+  stop("Batch and delivery group are confounded; this model cannot separate their effects.")
+}
+
+# Remove genes with very low total counts, then run the differential-expression test
+keep <- rowSums(count_mat) >= 10
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat[keep, ],
+  colData = meta,
+  design = ~ rnaseq_batch + delivery
+)
+
+dds <- DESeq(dds)
+
+# Positive log2FoldChange means higher expression in ring users
+res <- results(
+  dds,
+  contrast = c("delivery", "ring", "systemic"),
+  alpha = 0.05
+)
+
+results_table <- as.data.frame(res) |>
+  tibble::rownames_to_column("gene_id") |>
+  dplyr::arrange(padj)
+
+# Show the 20 genes with the smallest adjusted p-values
+results_table |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::slice_head(n = 20)
+
+# Count genes meeting the chosen false-discovery threshold
+sum(results_table$padj < 0.05, na.rm = TRUE)
+```
+
+**Result:** `log2FoldChange` compares ring to systemic users; positive values mean higher expression in the ring group, negative values mean lower. `padj` is the multiple-testing-adjusted p-value, which helps account for testing many genes. The final line counts genes with `padj < 0.05`.
+
+This tests for an **association** between delivery group and gene expression, not proof that delivery method caused a difference. The batch check matters because if the ring and systemic samples are separated entirely by sequencing batch, the data cannot distinguish a batch effect from a delivery-group effect.
+
+For your document’s `## Choices made` section, record the comparison, batch adjustment, low-count filter, and `padj < 0.05` threshold, along with an alternative you did not use.

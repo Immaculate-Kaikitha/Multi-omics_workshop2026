@@ -1,0 +1,182 @@
+---
+title: "Host gene expression by vaginal community type"
+format: html
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+The community groups come from the **microbiome species table** (same definition
+as notebook 02): the fraction of reads that belong to *Lactobacillus*, split at
+0.5. The gene table is then tested against those groups with DESeq2. That keeps
+the workshop rule intact: the group is defined from one table and tested on the
+other.
+
+Positive log2 fold change will mean **higher expression in `lactobacillus`
+samples**. We check the direction explicitly at the end.
+
+```{r}
+library(tidyverse)
+library(here)
+library(DESeq2)
+
+data_dir <- "data/2-workshop2/group_b_contraception"
+
+metadata <- read_csv(here(data_dir, "01_metadata.csv"))
+species_counts <- read_csv(here(data_dir, "02_microbiome_counts.csv"))
+taxonomy <- read_csv(here(data_dir, "03_microbiome_taxonomy.csv"))
+gene_counts <- read_csv(here(data_dir, "04_rnaseq_counts.csv.gz"))
+```
+
+## Step 1: define community from the microbiome table
+
+```{r}
+# Lactobacillus fraction per sample: Lactobacillus reads / all reads.
+# In this file the taxa are ROWS and the samples are columns.
+lacto_taxa <- taxonomy$taxon[taxonomy$Genus == "Lactobacillus"]
+counts_only <- as.matrix(species_counts[-1])          # drop the taxon column
+storage.mode(counts_only) <- "numeric"
+lacto_rows <- species_counts[[1]] %in% lacto_taxa
+
+sample_groups <- tibble(
+  sample_id      = colnames(counts_only),
+  total_reads    = colSums(counts_only),
+  lacto_reads    = colSums(counts_only[lacto_rows, , drop = FALSE]),
+  lacto_fraction = lacto_reads / total_reads,
+  community      = ifelse(lacto_fraction >= 0.5, "lactobacillus", "anaerobe")
+)
+
+# The split point and the group sizes
+sample_groups |>
+  ggplot(aes(lacto_fraction)) +
+  geom_histogram(binwidth = 0.05, colour = "white") +
+  geom_vline(xintercept = 0.5, colour = "red", linetype = "dashed") +
+  labs(x = "Lactobacillus fraction of all microbial reads",
+       y = "Number of samples",
+       title = "Dashed line = the 0.5 split")
+table(sample_groups$community)
+```
+
+Most samples sit near one end, which is the usual pattern: a vagina is
+typically either Lactobacillus-dominated or dominated by anaerobes. Samples
+near 0.5 are the ones where the label is a judgement call.
+
+For context: is community type just another name for contraceptive arm?
+
+```{r}
+metadata |>
+  left_join(sample_groups, by = "sample_id") |>
+  with(table(arm, community))
+```
+
+## Step 2: check the sample order before any test
+
+DESeq2 matches count columns to metadata rows by position only. If the orders
+differ, it will run without complaining and every result will be wrong, so we
+reorder to be sure rather than assume.
+
+```{r}
+meta <- as.data.frame(metadata)
+
+# Gene IDs in the first column, raw counts (never CPM, never logged) after it
+gene_ids <- gene_counts[[1]]
+count_mat <- as.matrix(gene_counts[-1])
+rownames(count_mat) <- gene_ids
+storage.mode(count_mat) <- "integer"
+
+stopifnot(!anyDuplicated(gene_ids),
+          !any(count_mat < 0),
+          all(count_mat == floor(count_mat)))
+
+# Reorder metadata rows to match the count columns, then prove they match
+meta <- meta[match(colnames(count_mat), meta$sample_id), ]
+rownames(meta) <- meta$sample_id
+
+stopifnot(identical(colnames(count_mat), rownames(meta)))
+stopifnot(identical(colnames(count_mat), sample_groups$sample_id))
+
+# Attach the community labels and set the reference level.
+# With "anaerobe" as reference, a POSITIVE log2FC means higher in "lactobacillus".
+meta <- meta |>
+  left_join(sample_groups, by = "sample_id")
+meta$community <- factor(meta$community, levels = c("anaerobe", "lactobacillus"))
+meta$rnaseq_batch <- factor(meta$rnaseq_batch)
+
+table(meta$community)
+```
+
+## Step 3: the DESeq2 test
+
+```{r}
+# Sequencing batch goes into the design so it does not masquerade as biology
+design_matrix <- model.matrix(~ rnaseq_batch + community, data = meta)
+stopifnot(qr(design_matrix)$rank == ncol(design_matrix))
+
+keep <- rowSums(count_mat) >= 10
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat[keep, ],
+  colData = meta,
+  design = ~ rnaseq_batch + community
+)
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("community", "lactobacillus", "anaerobe"),
+               alpha = 0.05)
+
+results_table <- as.data.frame(res) |>
+  tibble::rownames_to_column("gene_id") |>
+  arrange(padj)
+
+results_table |> filter(!is.na(padj)) |> slice_head(n = 20)
+sum(results_table$padj < 0.05, na.rm = TRUE)
+```
+
+## Step 4: check the direction of the contrast
+
+The sign of `log2FoldChange` is a claim about which group has the higher mean.
+Here is the independent check: count the reads per group directly and compare.
+
+```{r}
+norm <- counts(dds, normalized = TRUE)  # DESeq2's own normalised counts
+
+dir_check <- results_table |>
+  filter(!is.na(padj)) |> slice_head(n = 10) |>
+  mutate(
+    mean_lactobacillus = rowMeans(norm[gene_id, meta$community == "lactobacillus", drop = FALSE]),
+    mean_anaerobe = rowMeans(norm[gene_id, meta$community == "anaerobe", drop = FALSE]),
+    higher_in = ifelse(mean_lactobacillus > mean_anaerobe, "lactobacillus", "anaerobe"),
+    direction_agrees = (log2FoldChange > 0) == (mean_lactobacillus > mean_anaerobe)
+  )
+dir_check
+all(dir_check$direction_agrees)
+```
+
+If `direction_agrees` is TRUE throughout, the sign of every fold change means
+what we said: positive = higher in `lactobacillus`.
+
+```{r}
+# The single strongest gene, as a picture: each point is one sample
+plotCounts(dds, gene = results_table$gene_id[1],
+           intgroup = "community")
+```
+
+## Choices made
+
+- Community groups defined from the **microbiome species table** (Lactobacillus
+  fraction ≥ 0.5), then tested on the **gene table** — the alternative, using
+  the metadata `bv` column, would label almost the same samples but is a
+  clinical score, not a composition-based grouping.
+- Split at 0.5 with no buffer zone, so samples near 0.5 get a firm label.
+- *Lactobacillus* genus-level fraction (all Lactobacillus species); the
+  alternative of *L. iners* + *L. crispatus* only would barely change the
+  numbers because these two dominate the genus here.
+- Reference level set to `anaerobe`, so positive log2FC = higher in
+  `lactobacillus`; flipping the levels flips every sign but nothing else.
+- `rnaseq_batch` in the design (alternative: ignoring batch, which risks
+  calling batch effects biology).
+- Genes with fewer than 10 raw reads across all samples dropped.
+- Significance threshold: adjusted p (FDR) < 0.05; no fold-change cutoff, so
+  small-but-consistent shifts are kept (alternative: also require
+  |log2FC| ≥ 1).
+- No samples dropped.

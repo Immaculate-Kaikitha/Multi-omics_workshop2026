@@ -1,0 +1,411 @@
+---
+title: "Untitled"
+format: html
+---
+title: "Do hormonal contraceptives differ in their effect?"
+subtitle: "QC Vaginal microbiome and host gene expression · Study B, Group B2"
+author: "Group B2 Members"
+format:
+  qmdrslides-revealjs:
+    footer: "Group B2 · Contraceptive methods, the vaginal microbiome and host genes"
+    chalkboard: false
+    embed-resources: true
+    include-in-header:
+      - text: |
+          <style>
+          .reveal .qbox   { background:#fdf3e4; border-left:8px solid #f2a03d; padding:0.4em 0.7em; margin-bottom:0.4em; }
+          .reveal .answer { background:#e6f2f1; border-left:8px solid #00817c; padding:0.4em 0.7em; font-weight:600; color:#00403d; margin-bottom:0.4em; }
+          .reveal .note   { font-size:0.62em; color:#7a7273; }
+          .reveal table   { font-size:0.62em; }
+          .reveal .gt_table { font-size:18px !important; }
+          </style>
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+# Bioconductor packages first, tidyverse last, so dplyr's select()/filter() win.
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(microViz)
+  library(DESeq2)
+  library(vegan)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(gtsummary)
+  library(gt)
+  library(patchwork)
+  library(tidyverse)
+})
+
+theme_set(theme_minimal(base_size = 18))
+arm_cols      <- c(injectable = "#bf2642", pill = "#f2a03d", ring = "#00817c")
+delivery_cols <- c(systemic = "#73245e", ring = "#00817c")
+
+# Small helpers for numbers written into the text
+fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
+pct   <- function(x, d = 1) paste0(formatC(100 * x, format = "f", digits = d), "%")
+big   <- function(x) format(x, big.mark = ",")
+
+data_dir   <- "/workspaces/multi-omics_workshop2026/data/2-workshop2/group_b_contraception"
+metadata   <- read_csv(file.path(data_dir, "01_metadata.csv"),            show_col_types = FALSE)
+species    <- read_csv(file.path(data_dir, "02_microbiome_counts.csv"),   show_col_types = FALSE)
+taxonomy   <- read_csv(file.path(data_dir, "03_microbiome_taxonomy.csv"), show_col_types = FALSE)
+genes      <- read_csv(file.path(data_dir, "04_rnaseq_counts.csv.gz"),    show_col_types = FALSE)
+gene_annot <- read_csv(file.path(data_dir, "05_gene_annotation.csv"),     show_col_types = FALSE)
+cytokines  <- read_csv(file.path(data_dir, "06_cytokines.csv"),           show_col_types = FALSE)
+
+# One tidy sample table used everywhere
+samples <- metadata |>
+  mutate(
+    arm            = factor(arm, levels = c("injectable", "pill", "ring")),
+    delivery_group = factor(if_else(arm == "ring", "ring", "systemic"), levels = c("systemic", "ring")),
+    bv             = factor(bv, levels = c("negative", "intermediate", "positive")),
+    bv_status      = factor(if_else(bv == "positive", "Positive", "Not positive"),
+                            levels = c("Not positive", "Positive")),
+    rnaseq_batch   = factor(rnaseq_batch)
+  ) |>
+  as.data.frame()
+rownames(samples) <- samples$sample_id
+```
+
+# Part 1 · The study {background-color="#1b3a4b"}
+
+## The study
+
+A **cross-sectional** comparison of three hormonal contraceptive methods. Each
+woman was sampled **once**.
+
+| | |
+|---|---|
+| Participants | 93, one sample each |
+| Arms | 39 injectable, 28 pill, 26 ring |
+| Metadata | `arm`, `bv` (Amsel), `nugent`, `ph`, `any_sti`, `rnaseq_batch` |
+| Measurements | vaginal microbiome (species counts), host RNA-seq (gene counts), cytokines |
+
+The ring releases its hormone **locally** in the vagina; the pill and the
+injectable act through the whole body (**systemic**).
+
+::: note
+Nobody was randomised to a method, and people who choose different methods differ
+in other ways. Every result here is an **association**, not proof of cause.
+:::
+
+## Who is in the study?
+
+```{r}
+#| label: table-one
+samples |>
+  select(arm, bv, nugent, ph, any_sti, rnaseq_batch) |>
+  mutate(any_sti = factor(any_sti, levels = c(0, 1), labels = c("No", "Yes"))) |>
+  tbl_summary(
+    by = arm,
+    type = list(ph ~ "continuous", nugent ~ "continuous"),
+    label = list(bv ~ "BV (Amsel)", nugent ~ "Nugent score", ph ~ "Vaginal pH",
+                 any_sti ~ "Any STI", rnaseq_batch ~ "RNA-seq batch")
+  ) |>
+  add_overall() |>
+  add_p() |>
+  bold_labels() |>
+  modify_header(label ~ "**Characteristic**") |>
+  as_gt() |>
+  tab_options(table.font.size = px(17), data_row.padding = px(2))
+```
+
+# Part 2 · Quality control {background-color="#1b3a4b"}
+
+```{r}
+#| label: qc-prep
+micro_mat <- as.matrix(species[, -1])
+rna_mat   <- as.matrix(genes[, -1])
+cytokine_cols <- setdiff(names(cytokines), "sample_id")
+
+datasets <- list(`Metadata` = metadata, `Microbiome counts` = species, `Taxonomy` = taxonomy,
+                 `RNA-seq counts` = genes, `Gene annotation` = gene_annot, `Cytokines` = cytokines)
+hidden_na_codes <- c("", "na", "n/a", "nan", "null", "missing", "none", ".", "-", "?")
+
+missing_overview <- imap_dfr(datasets, function(data, name) {
+  value_cols <- data[, -1]
+  text_cols  <- select(data, where(is.character))
+  tibble(Dataset = name, Rows = nrow(data), Columns = ncol(data),
+         `Missing values` = sum(is.na(data)),
+         `% missing` = round(100 * mean(is.na(value_cols)), 2),
+         `Rows affected` = sum(!complete.cases(data)),
+         `Hidden missing (text)` = sum(map_int(text_cols, ~ sum(str_to_lower(str_trim(.x)) %in% hidden_na_codes, na.rm = TRUE))),
+         `Duplicate rows` = sum(duplicated(data)))
+})
+
+cytokine_missing <- cytokines |>
+  filter(if_any(all_of(cytokine_cols), is.na)) |>
+  select(sample_id) |>
+  left_join(samples, by = "sample_id")
+unannotated <- gene_annot |> filter(if_any(-ensembl_gene_id, is.na))
+
+detection_floor <- cytokines |>
+  pivot_longer(-sample_id, names_to = "cytokine", values_to = "value") |>
+  filter(!is.na(value)) |>
+  group_by(cytokine) |>
+  summarise(pct_floor = 100 * mean(value == min(value)), .groups = "drop") |>
+  arrange(desc(pct_floor))
+```
+
+## Is the data clean?
+
+```{r}
+#| label: qc-overview
+missing_overview |>
+  gt() |>
+  tab_style(style = cell_fill(color = "#fde7e7"), locations = cells_body(rows = `Missing values` > 0)) |>
+  tab_options(table.font.size = px(19), data_row.padding = px(3))
+```
+
+- **No duplicates**, one sample per woman, and the same 93 women appear in every table.
+- Missing values are found in **two tables only** (shaded): the gene annotation and the cytokines.
+- Both RNA-seq batches contain every arm, so batch can be adjusted for.
+
+## Missing data: where is it? {.smaller}
+
+:::: {.columns}
+::: {.column width="55%"}
+```{r}
+#| label: qc-missing-map
+#| fig-width: 7
+#| fig-height: 6.5
+cytokines |>
+  pivot_longer(-sample_id, names_to = "cytokine", values_to = "value") |>
+  mutate(status = if_else(is.na(value), "Missing", "Observed")) |>
+  ggplot(aes(cytokine, sample_id, fill = status)) +
+  geom_tile() +
+  scale_fill_manual(values = c(Missing = "#bf2642", Observed = "grey88")) +
+  labs(title = "Cytokine missingness map", x = NULL, y = "93 women", fill = NULL) +
+  theme(axis.text.y = element_blank(), axis.text.x = element_text(angle = 60, hjust = 1, size = 13),
+        panel.grid = element_blank(), legend.position = "bottom")
+```
+:::
+
+::: {.column width="45%"}
+**Cytokines:** `r nrow(cytokine_missing)` women
+(`r paste0(cytokine_missing$sample_id, ", ", cytokine_missing$arm, collapse = "; ")`)
+have **no** cytokine values: `r sum(is.na(cytokines))` cells,
+`r round(100 * mean(is.na(cytokines[, cytokine_cols])), 1)`% of all values.
+Whole samples are missing, in different arms, so it looks unrelated to the method.
+
+**Gene annotation:** `r nrow(unannotated)` of `r big(nrow(gene_annot))` genes
+have no symbol, name or locus group (all three missing together).
+
+**Everything else is complete:** metadata, microbiome counts, taxonomy and RNA-seq counts.
+:::
+::::
+
+## Missing data: what we did {.smaller}
+
+| Dataset | What is missing | How it is handled |
+|---|---|---|
+| Metadata, microbiome, RNA-seq | Nothing | All 93 women enter every question; **nobody is dropped** |
+| Gene annotation | `r nrow(unannotated)` genes without a symbol | Still tested by Ensembl ID; enrichment uses Ensembl IDs. None of the significant ring genes is unannotated |
+| Cytokines | `r nrow(cytokine_missing)` women with no values | Cytokines are not used in Q1 to Q6, so results are unaffected. A cytokine analysis would use the `r nrow(cytokines) - nrow(cytokine_missing)` complete women |
+| Cytokines | Values at the detection floor (up to `r round(detection_floor$pct_floor[1])`% of women for `r detection_floor$cytokine[1]`) | Treat as "below detection" (censored, or detected / not detected), not as exact values |
+
+::: answer
+The tables used for Q1 to Q6 are complete. Missing data are small, clearly
+located, and do not change any result.
+:::
+
+## QC: sequencing depth
+
+```{r}
+#| label: qc-depth
+#| fig-width: 15
+#| fig-height: 6.5
+depth <- samples |>
+  select(sample_id, arm, rnaseq_batch) |>
+  left_join(tibble(sample_id = names(species)[-1], micro = colSums(micro_mat)), by = "sample_id") |>
+  left_join(tibble(sample_id = names(genes)[-1],   rna   = colSums(rna_mat)),   by = "sample_id")
+
+p_micro <- ggplot(depth, aes(arm, micro, colour = arm)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.15, size = 3, alpha = 0.75) +
+  scale_colour_manual(values = arm_cols, guide = "none") +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(title = "Microbiome reads per woman", x = NULL, y = "Reads (log scale)")
+p_rna <- ggplot(depth, aes(arm, rna / 1e6)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey40") +
+  geom_jitter(aes(colour = rnaseq_batch), width = 0.15, size = 3, alpha = 0.75) +
+  scale_colour_manual(values = c(B1 = "#73245e", B2 = "#f2a03d")) +
+  labs(title = "RNA-seq reads per woman", x = NULL, y = "Reads (millions)", colour = "Batch")
+p_micro + p_rna
+```
+
+::: note
+Microbiome: `r big(min(depth$micro))` to `r big(max(depth$micro))` reads; RNA-seq:
+`r round(min(depth$rna) / 1e6, 1)` to `r round(max(depth$rna) / 1e6, 1)` million reads.
+Depth is similar across arms and batches. Even the shallowest microbiome sample has over
+5,000 reads, enough to profile a community dominated by a few species, so no woman is removed.
+:::
+
+## QC: what the microbiomes look like
+
+```{r}
+#| label: qc-composition
+#| fig-width: 16
+#| fig-height: 6.8
+taxon_share <- rowSums(sweep(micro_mat, 2, colSums(micro_mat), "/"))
+top_taxa    <- species$taxon[order(taxon_share, decreasing = TRUE)][1:8]
+
+composition <- species |>
+  pivot_longer(-taxon, names_to = "sample_id", values_to = "reads") |>
+  group_by(sample_id) |> mutate(share = reads / sum(reads)) |> ungroup() |>
+  mutate(taxon = if_else(taxon %in% top_taxa, taxon, "other"),
+         taxon = str_to_sentence(str_replace_all(taxon, "_", " "))) |>
+  group_by(sample_id, taxon) |> summarise(share = sum(share), .groups = "drop") |>
+  left_join(select(samples, sample_id, arm), by = "sample_id")
+
+women_order <- composition |>
+  group_by(sample_id) |> slice_max(share, n = 1, with_ties = FALSE) |> ungroup() |>
+  arrange(taxon, desc(share)) |> pull(sample_id)
+
+composition |>
+  mutate(sample_id = factor(sample_id, levels = women_order),
+         taxon = fct_relevel(factor(taxon), "Other", after = Inf)) |>
+  ggplot(aes(sample_id, share, fill = taxon)) +
+  geom_col(width = 1) +
+  facet_grid(~ arm, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = scales::label_percent(), expand = c(0, 0)) +
+  scale_fill_brewer(palette = "Paired") +
+  labs(x = "Women (sorted by dominant species)", y = "Share of reads", fill = NULL) +
+  guides(fill = guide_legend(nrow = 3)) +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank(), legend.position = "bottom",
+        legend.text = element_text(size = 14))
+```
+
+::: note
+Profiles look like typical vaginal microbiomes: *Lactobacillus* dominated or a mix of
+anaerobes such as *Gardnerella*. Every arm contains every kind of profile.
+:::
+
+## QC: RNA-seq gene filter and samples
+
+```{r}
+#| label: qc-rnaseq
+#| fig-width: 16
+#| fig-height: 6.5
+gene_kept <- rowSums(rna_mat >= 10) >= 10
+p_filter <- tibble(mean_log2 = log2(rowMeans(rna_mat) + 1),
+                   status = if_else(gene_kept, "Kept", "Removed")) |>
+  ggplot(aes(mean_log2, fill = status)) +
+  geom_histogram(bins = 60, alpha = 0.85, position = "identity") +
+  scale_fill_manual(values = c(Kept = "#00817c", Removed = "#bf2642")) +
+  labs(title = paste0(big(sum(gene_kept)), " of ", big(length(gene_kept)), " genes kept"),
+       x = "Mean count per gene, log2(count + 1)", y = "Genes", fill = NULL) +
+  theme(legend.position = "bottom")
+
+log_cpm <- log2(t(t(rna_mat[gene_kept, ]) / colSums(rna_mat[gene_kept, ])) * 1e6 + 1)
+p_samples <- as_tibble(log_cpm) |>
+  mutate(gene = row_number()) |>
+  pivot_longer(-gene, names_to = "sample_id", values_to = "log_cpm") |>
+  left_join(select(samples, sample_id, rnaseq_batch), by = "sample_id") |>
+  ggplot(aes(reorder(sample_id, log_cpm, median), log_cpm, fill = rnaseq_batch)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.2) +
+  scale_fill_manual(values = c(B1 = "#73245e", B2 = "#f2a03d")) +
+  labs(title = "Expression in each woman (kept genes)", x = "Women (ordered by median)",
+       y = "log2 counts per million", fill = "Batch") +
+  theme(axis.text.x = element_blank(), legend.position = "bottom")
+p_filter + p_samples + plot_layout(widths = c(1, 1.5))
+```
+
+::: note
+The filter (at least 10 reads in at least 10 women) removes only
+`r sum(!gene_kept)` genes. All women have similar expression distributions and
+the two batches are interleaved: no outlier samples.
+:::
+
+## QC: cytokines at the detection limit
+
+```{r}
+#| label: qc-floor
+#| fig-width: 13
+#| fig-height: 6
+ggplot(detection_floor, aes(reorder(cytokine, pct_floor), pct_floor)) +
+  geom_col(fill = "#f2a03d") +
+  geom_text(aes(label = paste0(round(pct_floor), "%")), hjust = -0.2, size = 5.5) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 105), breaks = seq(0, 100, 25), expand = c(0, 0)) +
+  labs(title = "Share of women at the lowest value of each cytokine",
+       x = NULL, y = "% of women with a measurement")
+```
+
+::: note
+A value repeated at the very bottom (for example IL-4 = 0.05) means "too low to
+measure". These are hidden missing values: the true level is unknown. Cytokines
+are not used in Q1 to Q6, but any later analysis must treat them as censored.
+:::
+
+# Part 3 · Our questions {background-color="#1b3a4b"}
+
+
+:::: {.columns}
+::: {.column width="50%"}
+**Group sizes**
+
+- Ring: **`r n_ring`** women
+- Systemic (pill + injectable): **`r n_sys`** women
+- Smallest single arm: 26 (ring)
+:::
+
+::: {.column width="50%"}
+**What we can detect (80% power, α = 0.05)**
+
+- BV, ring vs systemic: only if BV goes from
+  **`r pct(p_sys, 0)`** to about **`r pct(p_detect, 0)`**
+  (a gap of about `r round(100 * (p_detect - p_sys))` percentage points).
+- Two single arms (26 vs 28): needs a large effect (Cohen's h ≈ `r round(h_pair, 2)`).
+:::
+::::
+
+::: answer
+Large differences can be found; modest ones can easily be missed. "No
+difference" therefore means "no **large** difference".
+:::
+
+## Our six questions
+
+| Microbiome | Host | Connecting the two |
+|---|---|---|
+| **Q1.** Do the three methods differ in community composition? | **Q3.** Does the locally delivered ring differ from the two systemic methods in host gene expression? | **Q5.** Group people by community type, then test their genes. Does community type explain more than the method does? |
+| **Q2.** Is bacterial vaginosis more common in one arm? | **Q4.** Which biological processes do the ring versus systemic genes point to? (enrichment) | **Q6.** Is bacterial vaginosis the explanation for whatever the method seems to do? |
+
+Every question follows the same path: **question & approach → output → what it means**.
+
+```{r}
+#| label: build-objects
+# ---- Microbiome: phyloseq object ----
+count_matrix <- species |> column_to_rownames("taxon") |> as.matrix()
+count_matrix <- count_matrix[, samples$sample_id]
+taxonomy_matrix <- taxonomy |> column_to_rownames("taxon") |> as.matrix()
+taxonomy_matrix <- taxonomy_matrix[rownames(count_matrix), ]
+
+ps_species <- phyloseq(
+  otu_table(count_matrix, taxa_are_rows = TRUE),
+  sample_data(select(samples, -sample_id)),
+  tax_table(taxonomy_matrix)
+)
+
+# ---- Host genes: raw counts, filtered ----
+gene_counts <- genes |> column_to_rownames("ensembl_gene_id") |> as.matrix()
+gene_counts <- gene_counts[, samples$sample_id]
+storage.mode(gene_counts) <- "integer"
+gene_counts_filtered <- gene_counts[rowSums(gene_counts >= 10) >= 10, ]
+
+dds <- DESeqDataSetFromMatrix(gene_counts_filtered, samples, ~ rnaseq_batch + delivery_group)
+vsd <- vst(dds, blind = TRUE)
+vst_matrix <- assay(vsd)
+vst_dist   <- dist(t(vst_matrix))
+
+pca_raw     <- plotPCA(vsd, intgroup = "delivery_group", returnData = TRUE)
+pca_percent <- round(100 * attr(pca_raw, "percentVar"))
+pca_data    <- pca_raw |> select(PC1, PC2, sample_id = name) |> left_join(samples, by = "sample_id")
+pca_axes    <- labs(x = paste0("PC1 (", pca_percent[1], "%)"), y = paste0("PC2 (", pca_percent[2], "%)"))
+```

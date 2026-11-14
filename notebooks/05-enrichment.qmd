@@ -74,6 +74,67 @@ Run `fgsea(sets, stat, minSize = 15, maxSize = 500)` and sort by `padj`.*
 
 - Genes in the ranking, and how many of them appear in at least one set?
   - *Your answer:*
+
+```{r}
+# The ranking: one number per gene, the DESeq2 Wald statistic. Positive stat
+# means higher in PRETERM (the contrast was preterm vs term), so a set with a
+# positive NES is up in preterm. fgsea needs the vector NAMED by the gene ID.
+rank_outcome <- genes_by_outcome |>
+  select(feature, stat) |>
+  drop_na(feature, stat) |> # genes DESeq2 could not test have no stat
+  arrange(desc(stat)) |>    # fgsea expects a decreasingly ranked vector
+  deframe()                 # two columns -> one named vector
+
+# Same identifiers in the ranking and in the sets? Hallmark is built with
+# Ensembl IDs here, so the names must line up before anything else matters.
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H") |>  # 50 sets
+  select(gs_name, ensembl_gene) |>                                  # long format
+  filter(!is.na(ensembl_gene))
+
+sets <- split(hallmark$ensembl_gene, hallmark$gs_name)
+hallmark_ids <- unique(hallmark$ensembl_gene)
+matched_genes <- intersect(names(rank_outcome), hallmark_ids)
+
+# The identifier check, three ways:
+# 1. Is every ID in the ranking the same KIND of ID (all Ensembl-shaped)?
+all(grepl("^ENSG[0-9]+$", names(rank_outcome)))
+# 2. How many ranked genes sit in at least one Hallmark set?
+length(matched_genes)
+length(matched_genes) / length(rank_outcome)
+# 3. How many genes from each set actually match the ranking?
+min(vapply(sets, function(ids) sum(ids %in% names(rank_outcome)), integer(1)))
+
+if (anyDuplicated(names(rank_outcome))) {
+  stop("The gene ranking contains duplicate feature IDs.", call. = FALSE)
+}
+if (length(matched_genes) == 0) {
+  stop("No ranked Ensembl IDs matched the Hallmark gene sets.", call. = FALSE)
+}
+
+# A seed: fgsea shuffles genes at random when it builds its null, so without
+# one the padj values move slightly every time you knit.
+set.seed(1)
+fgsea_outcome <- fgsea(pathways = sets,
+                       stats    = rank_outcome,
+                       minSize  = 15,
+                       maxSize  = 500) |>
+  as.data.frame() |>
+  arrange(padj)
+
+fgsea_outcome |> select(pathway, size, ES, NES, padj, leadingEdge) |> head(10)
+```
+
+```{r}
+# The two summary numbers the exercise asks for
+c(genes_ranked = length(rank_outcome),
+  ranked_in_a_set = length(matched_genes),
+  sets_tested = nrow(fgsea_outcome),
+  sig_padj_05 = sum(fgsea_outcome$padj < 0.05),
+  higher_in_preterm = sum(fgsea_outcome$padj < 0.05 &
+                            fgsea_outcome$NES > 0),
+  higher_in_term = sum(fgsea_outcome$padj < 0.05 &
+                            fgsea_outcome$NES < 0))
+```
 - Sets significant, and how many point each way (26, with 23 higher in preterm)?
   - *Your answer:*
 

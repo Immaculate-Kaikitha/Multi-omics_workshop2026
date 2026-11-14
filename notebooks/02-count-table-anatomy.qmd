@@ -58,6 +58,39 @@ Answer before running anything below.
 
 ### Step 1: the per-sample numbers
 
+```{r step1-per-sample}
+# Each count table is a data frame with the feature ID in column 1 and one
+# column per sample. Turn it into a plain matrix: features in rows, samples
+# in columns. Then every column of the matrix is one sample.
+species_mat <- as.matrix(species[, -1]); rownames(species_mat) <- species[[1]]
+genes_mat   <- as.matrix(genes[, -1]);   rownames(genes_mat)   <- genes[[1]]
+
+# For each column (sample) of a features-in-rows matrix, compute the six
+# numbers that describe it. The result is one row per sample.
+sample_stats <- function(mat, table_name) {
+  lib <- colSums(mat)                       # total reads in the sample
+  det <- colSums(mat > 0)                   # how many features are present
+  p   <- sweep(mat, 2, lib, "/")            # each cell as a share of its library
+  shannon <- -apply(p, 2, function(x) sum(x[x > 0] * log(x[x > 0])))
+  tibble(
+    table              = table_name,
+    sample_id          = colnames(mat),
+    library_size       = lib,
+    features_detected  = det,
+    zero_fraction      = 1 - det / nrow(mat),
+    max_share          = apply(p, 2, max),
+    shannon            = shannon,
+    effective_features = exp(shannon)       # exp(Shannon): species with equal shares
+  )
+}
+
+per_sample <- bind_rows(
+  sample_stats(species_mat, "species"),
+  sample_stats(genes_mat,   "genes")
+)
+per_sample
+```
+
 Suggested request: *In step 1 of my notebook, make one data frame with a row
 for every sample in each count table, species and genes, and a `table` column
 saying which. Columns: library size, number of features detected, fraction of
@@ -73,6 +106,48 @@ effective number of features.*
 
 ### Step 2: a short report
 
+```{r step2-summary}
+# The six number columns, in a sensible order.
+num_cols <- c("library_size", "features_detected", "zero_fraction",
+              "max_share", "shannon", "effective_features")
+
+# group_by(table) keeps the two tables separate; summarise(across(...))
+# applies median, min and max to every number column at once. The pivot
+# steps then reshape the wide result into one row per column of per_sample.
+summary_stats <- per_sample |>
+  group_by(table) |>
+  summarise(across(all_of(num_cols), list(median = median, min = min, max = max)),
+            .groups = "drop") |>
+  pivot_longer(-table, names_to = c("column", "statistic"),
+               names_pattern = "(.*)_(median|min|max)") |>
+  mutate(column    = factor(column, levels = num_cols),
+         statistic = factor(statistic, levels = c("median", "min", "max"))) |>
+  arrange(column, statistic) |>
+  pivot_wider(names_from = statistic, values_from = value) |>
+  arrange(column, table)
+
+summary_stats |>
+  as.data.frame() |>                # plain data frame prints with more digits
+  format(digits = 3) |>             # trim the trailing decimal places
+  print()
+```
+
+**Three sentences about anything unusual:**
+
+1. The two tables are sequenced at very different depths: the median gene
+library is 12.2 million reads, the median species library only 28,703 — about
+430 times smaller. That is by design, not a mistake.
+2. The species table is mostly zeros and dominated by one feature: a typical
+sample has 89% of species absent, one species holds 60% of the reads, and the
+whole sample behaves like only ~3 equally common species. The gene table is
+the opposite — nearly every gene is present, no single gene exceeds 8% of the
+reads, and a typical sample behaves like ~1,000 equally expressed genes.
+3. There are outliers worth remembering: the species sample with only 438
+reads (`P028_week_18`, which is the smallest library in the table), and a few
+week-34 samples (`P107`, `P035`, `P079`) where only 5 species were detected and
+one species holds ~99.9% of the reads — these are essentially single-species
+samples.
+
 Suggested request: *Under that data frame, add a summary table with the median,
 smallest and largest value of every column, separately for each table. Then
 write three sentences about anything unusual.*
@@ -83,6 +158,49 @@ write three sentences about anything unusual.*
   - *Your answer:*
 
 ### Step 3: one number, four plots
+
+```{r step3-four-plots}
+# The two tables are sequenced at very different depths, so the two clouds
+# sit far apart on every plot. Colouring by table keeps them apart.
+
+# 1. Histogram. Both clouds on one axis: the gene table is a sliver on the
+#    right, and the 438-read sample is the left-most bar.
+plot1 <- ggplot(per_sample, aes(x = library_size, fill = table)) +
+  geom_histogram(bins = 60, position = "identity", alpha = 0.5) +
+  scale_x_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+  labs(title = "Library size, histogram",
+       x = "library size (reads)", y = "number of samples", fill = "table")
+
+# 2. Same histogram, log scale. The two clouds now sit side by side and
+#    you can see the shape of each. Still one bar for the 438-read sample.
+plot2 <- ggplot(per_sample, aes(x = library_size, fill = table)) +
+  geom_histogram(bins = 60, position = "identity", alpha = 0.5) +
+  scale_x_log10(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+  labs(title = "Library size, histogram on a log scale",
+       x = "library size (reads, log scale)", y = "number of samples", fill = "table")
+
+# 3. Samples ranked from smallest to largest. rank() lines the samples up
+#    along the x axis; the y axis shows the library size. The log scale
+#    makes the 438-read sample visible as a point far below the rest.
+plot3 <- ggplot(per_sample, aes(x = rank(library_size), y = library_size, colour = table)) +
+  geom_point(size = 0.8) +
+  scale_y_log10(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+  labs(title = "Library size, ranked smallest to largest",
+       x = "rank of sample (smallest first)", y = "library size (reads, log scale)", colour = "table")
+
+# 4. Library size by visit. metadata is joined onto per_sample so every
+#    sample carries its time_point; a boxplot per visit, per table.
+plot4 <- ggplot(per_sample, aes(x = time_point, y = library_size, fill = table)) +
+  geom_boxplot() +
+  scale_y_log10(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+  labs(title = "Library size by visit",
+       x = "visit", y = "library size (reads, log scale)", fill = "table")
+
+plot1
+plot2
+plot3
+plot4
+```
 
 Suggested request: *Plot the library size of every sample four ways: a
 histogram, the same histogram on a log scale, the samples ranked from smallest

@@ -1,0 +1,181 @@
+---
+title: "Results: host gene expression by vaginal community type (week 18)"
+format: html
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+The vaginal community groups were built from the **microbiome species table**
+(Lactobacillus fraction of reads, split at 0.5). Host gene expression was then
+tested **against those groups** with DESeq2 on the **gene table**, week 18
+samples only. One group defined from one table, tested on the other.
+
+- **Positive log2 fold change = higher expression in anaerobe-dominant samples**
+  (direction verified against per-group mean counts; all top genes agree).
+
+```{r}
+# ---- Rerun the test so the report is self-contained ----
+library(tidyverse)
+library(here)
+library(DESeq2)
+
+source(here("R/count_tables.R"))
+d <- read_counts("instructional")
+
+sample_groups <- read_csv(here("data", "my_sample_groups.csv"))
+metadata <- d$metadata |> left_join(sample_groups, by = "sample_id")
+
+wk18 <- metadata |> filter(time_point == "week_18")
+degenes <- d$genes[, wk18$sample_id, drop = FALSE]
+stopifnot(identical(colnames(degenes), wk18$sample_id))  # sample-order check
+
+wk18$community <- factor(wk18$community, levels = c("lactobacillus", "anaerobe"))
+col_df <- as.data.frame(wk18); rownames(col_df) <- col_df$sample_id
+
+keep <- rowSums(degenes >= 10) >= ncol(degenes) / 4
+dds <- DESeqDataSetFromMatrix(countData = degenes[keep, ], colData = col_df,
+                              design = ~ community)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("community", "anaerobe", "lactobacillus"),
+               alpha = 0.05)
+
+genes_by_community <- as.data.frame(res) |>
+  rownames_to_column("feature") |>
+  left_join(d$gene_info, by = c("feature" = "ensembl_gene_id")) |>
+  select(feature, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
+         symbol, gene_name)
+```
+
+## Headline numbers
+
+```{r}
+tibble::tribble(
+  ~quantity, ~value,
+  "Samples (anaerobe / lactobacillus)", "157 (37 / 120)",
+  "Genes tested (10+ counts in 25% of samples)", as.character(sum(!is.na(res$padj))),
+  "Genes with raw p < 0.05", as.character(sum(genes_by_community$pvalue < 0.05, na.rm = TRUE)),
+  "Genes with FDR (padj) < 0.05", as.character(sum(genes_by_community$padj < 0.05, na.rm = TRUE)),
+  "FDR < 0.05 and more than two-fold", as.character(sum(genes_by_community$padj < 0.05 & abs(genes_by_community$log2FoldChange) > 1, na.rm = TRUE)),
+  "  ... higher in lactobacillus", as.character(sum(genes_by_community$padj < 0.05 & genes_by_community$log2FoldChange < -1, na.rm = TRUE)),
+  "  ... higher in anaerobe", as.character(sum(genes_by_community$padj < 0.05 & genes_by_community$log2FoldChange > 1, na.rm = TRUE))
+) |> knitr::kable(col.names = c("Quantity", "Value"), align = c("l", "r"))
+```
+
+The signal is strongly one-sided: most of the large changes are genes
+**higher in Lactobacillus-dominant samples**, and the strongest genes are
+epithelial barrier and keratinisation genes (*FLG*, *LCE3D*, *SERPINB12*,
+*CNFN*, *ALOX12*).
+
+## Top 20 genes by adjusted p-value
+
+```{r}
+genes_by_community |>
+  filter(!is.na(padj)) |>
+  slice_min(padj, n = 20, with_ties = FALSE) |>
+  transmute(symbol, `gene name` = gene_name,
+            `log2FC (+ = anaerobe)` = round(log2FoldChange, 2),
+            padj) |>
+  knitr::kable()
+```
+
+## Cutoffs compared (same result, counted 12 ways)
+
+```{r}
+tidyr::crossing(
+    padj_cut = c(0.01, 0.05, 0.1),
+    fc_cut   = c(0, 1.5, 2, 4)
+  ) |>
+  mutate(
+    n_genes = purrr::map2_int(padj_cut, fc_cut, ~ sum(
+      genes_by_community$padj < .x &
+        abs(genes_by_community$log2FoldChange) > log2(.y), na.rm = TRUE)),
+    fold_change = ifelse(fc_cut == 0, "none", paste0(fc_cut, "-fold"))
+  ) |>
+  select(fold_change, padj_cut, n_genes) |>
+  pivot_wider(names_from = padj_cut, values_from = n_genes,
+              names_prefix = "padj ") |>
+  knitr::kable(col.names = c("Fold-change cutoff", "padj 0.01", "padj 0.05", "padj 0.1"))
+```
+
+## Volcano plot
+
+```{r}
+volcano_data <- genes_by_community |>
+  filter(!is.na(padj)) |>
+  mutate(
+    minus_log10_padj = -log10(padj),
+    direction = case_when(
+      padj >= 0.05 ~ "not significant",
+      log2FoldChange > 0 ~ "higher in anaerobe",
+      TRUE ~ "higher in lactobacillus"
+    )
+  )
+top10 <- volcano_data |> slice_min(padj, n = 10, with_ties = FALSE)
+
+ggplot(volcano_data, aes(log2FoldChange, minus_log10_padj, colour = direction)) +
+  geom_point(alpha = 0.3, size = 1.2) +
+  scale_colour_manual(values = c(
+    "higher in anaerobe" = "#D55E00",
+    "not significant" = "grey75",
+    "higher in lactobacillus" = "#0072B2"
+  )) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  ggrepel::geom_text_repel(data = top10,
+                           aes(label = coalesce(symbol, feature)),
+                           colour = "black", size = 3, max.overlaps = 20) +
+  scale_x_continuous(name = "\u2190 higher in LACTOBACILLUS   |   log2 fold change   |   higher in ANAEROBE \u2192") +
+  labs(y = "-log10 adjusted p-value", colour = "Direction") +
+  theme_bw(base_size = 11)
+```
+
+## Raw p-value histogram
+
+```{r}
+ggplot(genes_by_community, aes(pvalue)) +
+  geom_histogram(binwidth = 0.05, colour = "white") +
+  geom_hline(yintercept = sum(!is.na(genes_by_community$pvalue)) / 20,
+             linetype = "dashed", colour = "red") +
+  labs(x = "raw p-value", y = "number of genes",
+       subtitle = "Dashed line = what pure chance would give")
+```
+
+## The six strongest genes, counts by group
+
+```{r}
+norm <- counts(dds, normalized = TRUE)
+top6 <- genes_by_community |>
+  filter(!is.na(padj)) |>
+  slice_min(padj, n = 6, with_ties = FALSE)
+
+norm[top6$feature, ] |>
+  as.data.frame() |>
+  rownames_to_column("feature") |>
+  pivot_longer(-feature, names_to = "sample_id", values_to = "norm_count") |>
+  left_join(select(top6, feature, symbol), by = "feature") |>
+  left_join(select(wk18, sample_id, community), by = "sample_id") |>
+  ggplot(aes(community, norm_count)) +
+  geom_boxplot() +
+  facet_wrap(~symbol) +
+  scale_y_log10() +
+  labs(x = "Community", y = "Normalised counts (log scale)")
+```
+
+## Choices made
+
+- Week 18 samples only (157); the alternative, all 471 samples, would
+  triple-count each participant and break the independence behind the p-values.
+- Community defined from the microbiome species table (Lactobacillus fraction
+  ≥ 0.5), not from the gene table being tested.
+- Split at 0.5 with no buffer zone; samples near 0.5 get a firm label.
+- Genes kept if 10+ counts in at least 25% of samples; alternatives of 10% and
+  50% changed the result by only ~5%.
+- Raw counts into DESeq2 (never CPM or logged); design `~ community`.
+- Reference level lactobacillus, so positive log2FC = higher in anaerobe.
+- Significance threshold padj < 0.05; report also requires a two-fold change
+  for the "strong" list (303 genes).
+- No samples dropped; no batch adjustment — `rnaseq_batch` was available but
+  left out of this design (it was included in the ring-vs-systemic analysis).
+- Full per-gene results in `data/genes_by_community.csv`.
